@@ -2,6 +2,9 @@
 
 **Xray Analytics** is a local Manifest V3 Chrome extension that reveals additional daily metrics already returned to the X Analytics page, but not always offered in X's metric picker. It extends the existing Account overview chart instead of replacing it.
 
+> [!NOTE]
+> Xray Analytics is an unofficial local browser extension and is not affiliated with, endorsed by, or sponsored by X Corp. It does not make additional X requests, automate account actions, or transmit analytics data. It only visualizes data that X has already delivered to the signed-in user's Account overview page.
+
 > [!IMPORTANT]
 > The names and meanings below are informed interpretations of internal X response keys, not definitions published by X. X can rename, repurpose, omit, or remove them at any time. Treat them as exploratory analytics, not official reporting or billing data.
 
