@@ -1,0 +1,1140 @@
+(() => {
+  if (window.__xatHomeLingerPanelInstalled) return;
+  window.__xatHomeLingerPanelInstalled = true;
+
+  const MESSAGE = "x-analytics-engagement-types";
+  const METRIC_LABELS = Object.freeze({
+    Displayed: "Impressions",
+    HomeLinger: "Time spent in feed",
+    EngagementRollup: "Engagements",
+    EngagementRollupV2: "Engagements (v2)",
+    Fav: "Likes",
+    Unfav: "Unlikes",
+    Follow: "Follows",
+    Unfollow: "Unfollows",
+    Retweet: "Reposts",
+    Unretweet: "Unreposts",
+    QuoteTweet: "Quote posts",
+    UnquoteTweet: "Unquoted posts",
+    QuoteCreate: "Quote posts created",
+    Reply: "Replies",
+    ReplyCreate: "Replies created",
+    Unreply: "Unreplied posts",
+    Bookmark: "Bookmarks",
+    Unbookmark: "Unbookmarks",
+    Share: "Shares",
+    TweetCreate: "Posts created",
+    ProfilePic: "Profile photo views",
+    Detail: "Post detail views",
+    Url: "URL clicks",
+    ScreenName: "Username clicks",
+    UserName: "Profile username clicks",
+    EmbeddedMedia: "Embedded media views",
+    LingerTime: "Time spent in feed (recent)",
+    CardUrlClick: "Card URL clicks",
+    NotInterested: "Not interested",
+    Mute: "Mutes",
+    ArchivalFavorite: "Archived likes",
+    UnarchivalFavorite: "Restored likes",
+    ArchivalRetweet: "Archived reposts",
+    UnarchivalRetweet: "Restored reposts",
+    VideoContentPlaybackStart: "Video playback started",
+    VideoContentPlayback25: "Video watched 25%",
+    VideoContentPlayback50: "Video watched 50%",
+    VideoContentPlayback75: "Video watched 75%",
+    VideoContentPlayback95: "Video watched 95%",
+    VideoContentPlaybackComplete: "Video watched completely",
+    VideoContentViewThreshold: "Video threshold views",
+    VideoContentViewV2: "Video views",
+    VideoContentMrcView: "MRC video views",
+    VideoContentQualityView: "Video quality views",
+    ClientFav: "Client likes",
+    ClientReply: "Client replies",
+    ClientQuoteTweet: "Client quote posts",
+    ClientRetweet: "Client reposts",
+    ClientUnfav: "Client unlikes",
+    ClientUnretweet: "Client unreposts",
+    Follows: "Follows",
+    Unfollows: "Unfollows",
+    active_followers: "Active followers",
+    active_verified_followers: "Active verified followers",
+    followers: "Followers",
+    verified_follower_count: "Verified followers",
+  });
+  const NATIVE_METRICS = new Set([
+    "Displayed", "EngagementRollup", "Fav", "Follow", "Unfollow", "TweetCreate",
+    "ProfilePic", "Reply", "Retweet", "Bookmark", "Share"
+  ]);
+  const HIDDEN_METRICS = new Set(["LingerTime"]);
+  const SHORT_HISTORY_METRICS = new Set(["EngagementRollupV2", "Follows"]);
+  const MINIMUM_HISTORY_DAYS = 4;
+  const days = new Map();
+  const metricDays = new Map();
+  const receivedItems = new Map();
+  const receivedRecords = new Map();
+  const extraMetrics = new Map();
+  let root;
+  let homeEnabled = true;
+  let extraMetric = "HomeLinger";
+  let replacementSlot = null;
+  const selectedExtraBySlot = [null, null];
+  let verifiedOnly = false;
+  let lastMessage;
+  let chartState;
+  let hoverDay;
+  let tooltipFrame;
+  let maintenanceFrame;
+  let rangeWaitTimer;
+  let rangeRequestId = 0;
+  let pendingRangeKey = "";
+  let selectedRangeKey = "";
+
+  function isExtraMetric(metric) {
+    return Boolean(metric) && !NATIVE_METRICS.has(metric) && !HIDDEN_METRICS.has(metric);
+  }
+
+  function hasEnoughHistory(metric) {
+    if (SHORT_HISTORY_METRICS.has(metric)) return false;
+    const window = getDateWindow();
+    const dates = new Set();
+    for (const record of receivedRecords.values()) {
+      if (record.engagement_type !== metric || !record.time) continue;
+      if (window && (record.time < window.start || record.time > window.end)) continue;
+      dates.add(new Date(record.time).toISOString().slice(0, 10));
+    }
+    return dates.size >= MINIMUM_HISTORY_DAYS;
+  }
+
+  function showSelectionNotice(message) {
+    let notice = document.querySelector("#xat-selection-notice");
+    if (!notice) {
+      notice = document.createElement("div");
+      notice.id = "xat-selection-notice";
+      document.documentElement.appendChild(notice);
+    }
+    notice.textContent = message;
+    notice.hidden = false;
+    clearTimeout(showSelectionNotice.timer);
+    showSelectionNotice.timer = setTimeout(() => { notice.hidden = true; }, 3200);
+  }
+
+  function ensurePanel() {
+    document.querySelector("#xat-panel")?.remove();
+    document.querySelector("#xat-advanced-view")?.remove();
+    root = null;
+  }
+
+  function normalizeRecord(item) {
+    const fields = item.fields && typeof item.fields === "object" ? { ...item.fields } : { ...item };
+    const source = { ...fields, ...item };
+    const metricKey = source.engagement_type || source.metric_type || "";
+    const record = {
+      ...item,
+      fields,
+      engagement_type: metricKey,
+      metric_label: humanMetricName(metricKey),
+      time: getTimestamp(source),
+      verified: getVerified(source),
+      amount: getAmount(source),
+    };
+    fields.engagement_type = record.engagement_type;
+    fields.metric_key = metricKey;
+    fields.metric_label = record.metric_label;
+    return record;
+  }
+
+  function syncAdvancedButton() {
+    if (!root) return;
+    const button = root.querySelector("#xat-advanced-open");
+    if (!button) return;
+    const rangeKey = selectedRangeKey || getRangeKey(getRangeControls().find(control =>
+      control.className.includes("bg-text") || control.getAttribute("aria-pressed") === "true" || control.getAttribute("aria-checked") === "true"));
+    button.hidden = false;
+  }
+
+  function openAdvancedView() {
+    let view = document.querySelector("#xat-advanced-view");
+    if (!view) {
+      view = document.createElement("section");
+      view.id = "xat-advanced-view";
+      document.documentElement.appendChild(view);
+    }
+    view.hidden = false;
+    renderAdvancedView(view);
+    positionAdvancedView(view);
+  }
+
+  function positionAdvancedView(view) {
+    const target = findAccountOverviewTarget();
+    if (!target) return;
+    const rect = target.getBoundingClientRect();
+    view.style.left = `${Math.max(8, rect.left)}px`;
+    view.style.top = `${Math.max(8, rect.top)}px`;
+    view.style.width = `${Math.max(420, rect.width)}px`;
+    view.style.height = `${Math.max(360, Math.min(window.innerHeight - Math.max(8, rect.top) - 8, rect.height))}px`;
+  }
+
+  function findAccountOverviewTarget() {
+    const chart = document.querySelector("main .recharts-wrapper");
+    if (!chart) return null;
+    let candidate = chart.parentElement;
+    for (let depth = 0; candidate && depth < 8; depth++, candidate = candidate.parentElement) {
+      const rect = candidate.getBoundingClientRect();
+      const text = candidate.textContent || "";
+      if (rect.width >= 500 && rect.height >= 260 && rect.height <= 760 && /Account overview/i.test(text)) return candidate;
+    }
+    return chart.parentElement;
+  }
+
+  function renderAdvancedView(view) {
+    const defaultWindow = getDateWindow();
+    const from = view.dataset.from || toInputDate(defaultWindow.start);
+    const to = view.dataset.to || toInputDate(defaultWindow.end);
+    view.dataset.from = from;
+    view.dataset.to = to;
+    const records = [...receivedRecords.values()]
+      .filter(record => inDateRange(record.time, from, to))
+      .sort((a, b) => b.time - a.time || a.engagement_type.localeCompare(b.engagement_type));
+    const columns = ["engagement_type", "metric_label", "date", "timestamp", "count", "is_engaging_user_verified"];
+    for (const record of records) {
+      for (const key of Object.keys(record.fields)) if (!columns.includes(key)) columns.push(key);
+    }
+    const rangeKey = view.dataset.advancedRange || selectedRangeKey || getRangeKey(getRangeControls().find(control =>
+      control.className.includes("bg-text") || control.getAttribute("aria-pressed") === "true" || control.getAttribute("aria-checked") === "true")) || "7D";
+    const types = [...new Set(records.map(record => record.engagement_type))].sort();
+    const primary = view.dataset.primary || findType(types, /display|impression|view/i) || types[0] || "";
+    const secondary = view.dataset.secondary || findType(types, /engagement|bookmark|like/i, primary) || types[1] || "";
+    view.dataset.primary = primary;
+    view.dataset.secondary = secondary;
+    const metricOptions = (selected) => types.map(type => `<option value="${escapeAttr(type)}"${type === selected ? " selected" : ""}>${escapeHtml(humanMetricName(type))}</option>`).join("");
+    view.innerHTML = `
+      <div class="xat-advanced-card">
+        <div class="xat-dashboard-top"><div class="xat-analytics-title"><span class="xat-eyebrow">XRAY ANALYTICS</span><strong>Account overview</strong></div><div class="xat-dashboard-actions"><span class="xat-live-dot"></span><span>Live data</span><button class="xat-advanced-close" title="Close">×</button></div></div>
+        <nav class="xat-analytics-tabs"><span class="active">Overview</span><span>Audience</span><span>Content</span><span>Video</span><span>Live</span><span>Spaces</span></nav>
+        <div class="xat-dashboard-toolbar"><div class="xat-analytics-periods">${["7D", "2W", "4W", "3M", "1Y"].map(key => `<button class="xat-advanced-period${key === rangeKey ? " active" : ""}" data-range="${key}">${key}</button>`).join("")}</div><span class="xat-analytics-source">${records.length} records · ${types.length} metrics</span></div>
+        <section class="xat-analytics-main-card">
+          <div class="xat-card-heading"><div><strong>Performance</strong><span>Daily metric comparison</span></div><div class="xat-analytics-controls"><label class="xat-metric-select blue"><select class="xat-advanced-primary">${metricOptions(primary)}</select></label><label class="xat-metric-select green"><select class="xat-advanced-secondary">${metricOptions(secondary)}</select></label><label class="xat-pay-period"><select class="xat-chart-mode"><option value="bar">▥ Bars</option><option value="line">⌁ Lines</option></select></label></div></div>
+          <div class="xat-advanced-chart-frame"><div class="xat-chart-axis left"></div><div class="xat-advanced-chart"></div><div class="xat-chart-axis right"></div></div>
+        </section>
+        <div class="xat-analytics-secondary-grid"><section class="xat-analytics-small-card"><div><strong>Activity over time</strong><span>last ${rangeKey}</span></div><div class="xat-mini-chart"></div></section><section class="xat-analytics-small-card"><div><strong>Secondary metric</strong><span>${escapeHtml(humanMetricName(secondary))}</span></div><div class="xat-mini-chart green"></div></section></div>
+        <div class="xat-section-label">Snapshot</div>
+        <div class="xat-analytics-metric-grid">${types.slice(0, 10).map(type => `<div><span>${escapeHtml(humanMetricName(type))}</span><b>${formatNumber(sumRecords(records, type))}</b></div>`).join("")}</div>
+        <div class="xat-section-label xat-raw-label"><span>Data explorer</span><small>${records.length} rows</small></div>
+        <div class="xat-advanced-toolbar">
+          <label>From <input class="xat-advanced-from" type="date" value="${escapeAttr(from)}"></label>
+          <label>To <input class="xat-advanced-to" type="date" value="${escapeAttr(to)}"></label>
+          <button class="xat-advanced-apply">Apply</button>
+          <input class="xat-advanced-search" type="search" placeholder="Search values…">
+          <select class="xat-advanced-type"><option value="">All engagement types</option>${types.map(type => `<option value="${escapeAttr(type)}">${escapeHtml(type)}</option>`).join("")}</select>
+        </div>
+        <div class="xat-advanced-table-wrap">
+          <table class="xat-advanced-table"><thead><tr>${columns.map(column => `<th>${escapeHtml(column)}</th>`).join("")}</tr></thead><tbody>${records.map(record => `<tr data-type="${escapeAttr(record.engagement_type)}" data-search="${escapeAttr(JSON.stringify(record.fields).toLowerCase())}">${columns.map(column => `<td>${formatField(record.fields[column])}</td>`).join("")}</tr>`).join("")}</tbody></table>
+        </div>
+        <div class="xat-advanced-empty" hidden>No records match the current filter.</div>
+      </div>`;
+    view.querySelector(".xat-advanced-close").onclick = () => { view.hidden = true; };
+    view.querySelector(".xat-advanced-apply").onclick = () => {
+      view.dataset.from = view.querySelector(".xat-advanced-from").value;
+      view.dataset.to = view.querySelector(".xat-advanced-to").value;
+      renderAdvancedView(view);
+    };
+    view.querySelector(".xat-advanced-primary").onchange = event => { view.dataset.primary = event.target.value; renderAdvancedView(view); };
+    view.querySelector(".xat-advanced-secondary").onchange = event => { view.dataset.secondary = event.target.value; renderAdvancedView(view); };
+    for (const button of view.querySelectorAll(".xat-advanced-period")) {
+      button.onclick = () => {
+        const length = { "7D": 7, "2W": 14, "4W": 28, "3M": 90, "1Y": 365 }[button.dataset.range];
+        const end = new Date();
+        end.setUTCHours(0, 0, 0, 0);
+        const start = new Date(end);
+        start.setUTCDate(start.getUTCDate() - length + 1);
+        view.dataset.from = toInputDate(start);
+        view.dataset.to = toInputDate(end);
+        view.dataset.advancedRange = button.dataset.range;
+        renderAdvancedView(view);
+      };
+    }
+    const chartMode = view.querySelector(".xat-chart-mode");
+    chartMode.value = view.dataset.chartMode || "bar";
+    chartMode.onchange = event => { view.dataset.chartMode = event.target.value; renderAdvancedChart(view, records, view.querySelector(".xat-advanced-primary").value, view.querySelector(".xat-advanced-secondary").value); };
+    renderAdvancedChart(view, records, view.querySelector(".xat-advanced-primary").value, view.querySelector(".xat-advanced-secondary").value);
+    renderMiniChart(view.querySelectorAll(".xat-mini-chart")[0], records, view.querySelector(".xat-advanced-primary").value);
+    renderMiniChart(view.querySelectorAll(".xat-mini-chart")[1], records, view.querySelector(".xat-advanced-secondary").value);
+    positionAdvancedView(view);
+    const search = view.querySelector(".xat-advanced-search");
+    const type = view.querySelector(".xat-advanced-type");
+    const filter = () => {
+      const needle = search.value.trim().toLowerCase();
+      let visible = 0;
+      for (const row of view.querySelectorAll("tbody tr")) {
+        const matches = (!needle || row.dataset.search.includes(needle)) && (!type.value || row.dataset.type === type.value);
+        row.hidden = !matches;
+        if (matches) visible++;
+      }
+      view.querySelector(".xat-advanced-empty").hidden = visible !== 0;
+    };
+    search.oninput = filter;
+    type.onchange = filter;
+  }
+
+  function renderAdvancedChart(view, records, primary = "", secondary = "") {
+    const series = [primary, secondary].filter((type, index, values) => type && values.indexOf(type) === index);
+    const byDay = aggregateByDay(records, series);
+    const points = [...byDay.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+    const primaryMax = Math.max(...points.map(([, values]) => values[primary] || 0), 1);
+    const secondaryMax = Math.max(...points.map(([, values]) => values[secondary] || 0), 1);
+    const chart = view.querySelector(".xat-advanced-chart");
+    const mode = view.dataset.chartMode || "bar";
+    chart.innerHTML = points.length ? `<div class="xat-grid-lines"><i></i><i></i><i></i><i></i><i></i></div><div class="xat-chart-points ${mode}">${points.map(([day, values]) => `
+      <div class="xat-advanced-point" title="${escapeAttr(`${day}: ${series.map(type => `${humanMetricName(type)} ${formatNumber(values[type] || 0)}`).join(" · ")}`)}">
+        <div class="xat-advanced-bars">${series.map((type, index) => { const max = index ? secondaryMax : primaryMax; return `<div class="xat-advanced-bar ${index ? "green" : "blue"}" style="height:${Math.max(2, (values[type] || 0) / max * 100)}%"></div>`; }).join("")}</div>
+        <span>${escapeHtml(day.slice(5))}</span>
+      </div>`).join("")}</div>` : `<div class="xat-advanced-chart-empty">No numeric count/value/metric field is available for charting.</div>`;
+    const leftAxis = view.querySelector(".xat-chart-axis.left");
+    const rightAxis = view.querySelector(".xat-chart-axis.right");
+    const ticks = [1, .75, .5, .25, 0];
+    if (leftAxis) leftAxis.innerHTML = ticks.map(ratio => `<span>${formatNumber(primaryMax * ratio)}</span>`).join("");
+    if (rightAxis) rightAxis.innerHTML = ticks.map(ratio => `<span>${formatNumber(secondaryMax * ratio)}</span>`).join("");
+  }
+
+  function renderMiniChart(element, records, type) {
+    if (!element) return;
+    const byDay = aggregateByDay(records, type ? [type] : []);
+    const points = [...byDay.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+    const max = Math.max(...points.map(([, values]) => values[type] || 0), 1);
+    element.innerHTML = points.map(([day, values]) => `<i title="${escapeAttr(`${day}: ${formatNumber(values[type] || 0)}`)}" style="height:${Math.max(2, (values[type] || 0) / max * 100)}%"></i>`).join("");
+  }
+
+  function aggregateByDay(records, series) {
+    const byDay = new Map();
+    for (const record of records) {
+      if (series.length && !series.includes(record.engagement_type)) continue;
+      const day = record.time ? new Date(record.time).toISOString().slice(0, 10) : "No date";
+      const value = Number(record.fields.count ?? record.fields.value ?? record.fields.metric);
+      if (!Number.isFinite(value)) continue;
+      const current = byDay.get(day) || {};
+      current[record.engagement_type] = (current[record.engagement_type] || 0) + value;
+      byDay.set(day, current);
+    }
+    return byDay;
+  }
+
+  function sumRecords(records, type) {
+    return records.filter(record => record.engagement_type === type).reduce((sum, record) => {
+      const value = Number(record.fields.count ?? record.fields.value ?? record.fields.metric);
+      return sum + (Number.isFinite(value) ? value : 0);
+    }, 0);
+  }
+
+  function findType(types, pattern, exclude = "") {
+    return types.find(type => type !== exclude && pattern.test(type)) || "";
+  }
+
+  function humanMetricName(metricKey) {
+    if (!metricKey) return "Unknown metric";
+    if (METRIC_LABELS[metricKey]) return METRIC_LABELS[metricKey];
+    return String(metricKey)
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .replace(/([A-Za-z])(\d)/g, "$1 $2")
+      .replace(/([A-Z])(\d)/g, "$1 $2")
+      .replace(/_/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function inDateRange(time, from, to) {
+    if (!time) return true;
+    const start = Date.parse(`${from}T00:00:00Z`);
+    const end = Date.parse(`${to}T23:59:59.999Z`);
+    return (!Number.isFinite(start) || time >= start) && (!Number.isFinite(end) || time <= end);
+  }
+
+  function toInputDate(date) {
+    return date.toISOString().slice(0, 10);
+  }
+
+  function formatField(value) {
+    if (value === undefined) return `<span class="xat-field-empty">—</span>`;
+    if (value === null) return `<span class="xat-field-null">null</span>`;
+    if (typeof value === "object") return `<code>${escapeHtml(JSON.stringify(value))}</code>`;
+    return escapeHtml(String(value));
+  }
+
+  function render(message) {
+    if (!isAccountOverviewPage()) {
+      if (root) root.hidden = true;
+      cleanupCustomChartArtifacts();
+      chartState = null;
+      return;
+    }
+    ensurePanel();
+    lastMessage = message;
+    selectedExtraBySlot.forEach((metric, slot) => {
+      if (!isExtraMetric(metric)) selectedExtraBySlot[slot] = null;
+    });
+    for (const item of message.items) {
+      const record = normalizeRecord(item);
+      if (!record.engagement_type) continue;
+      if (record.time && isExtraMetric(record.engagement_type)) extraMetrics.set(record.engagement_type, record.metric_label || humanMetricName(record.engagement_type));
+      const key = [record.engagement_type, record.time || record.fields.date || "no-date", record.verified === null ? "unknown" : record.verified, record.amount].join("|");
+      receivedRecords.set(key, record);
+    }
+    const canonicalRecords = new Map();
+    for (const record of receivedRecords.values()) {
+      const key = [record.engagement_type, record.time || record.fields.date || "no-date", record.verified === null ? "unknown" : record.verified, record.amount].join("|");
+      canonicalRecords.set(key, record);
+    }
+    receivedRecords.clear();
+    for (const [key, record] of canonicalRecords) receivedRecords.set(key, record);
+    const allRecords = [...canonicalRecords.values()];
+    const preferred = allRecords.some(record => record.engagement_type === "HomeLinger")
+      ? "HomeLinger"
+      : extraMetrics.has(extraMetric) && allRecords.some(record => record.engagement_type === extraMetric)
+        ? extraMetric
+        : allRecords.map(record => record.engagement_type).find(type => isExtraMetric(type));
+    if (preferred) extraMetric = preferred;
+    receivedItems.clear();
+    for (const record of allRecords) if (record.engagement_type === extraMetric) receivedItems.set([
+      record.engagement_type,
+      record.time || record.fields.date || "no-date",
+      record.verified === null ? "unknown" : record.verified,
+      record.amount
+    ].join("|"), record);
+    const dateWindow = getDateWindow();
+    metricDays.clear();
+    const rangedItems = buildMetricDays(extraMetric, allRecords, dateWindow, days);
+    for (const metric of selectedExtraBySlot.filter(Boolean)) {
+      if (metric === extraMetric) continue;
+      const metricMap = new Map();
+      buildMetricDays(metric, allRecords, dateWindow, metricMap);
+      metricDays.set(metric, metricMap);
+    }
+    metricDays.set(extraMetric, new Map(days));
+    const sorted = [...days.entries()].sort((a, b) => b[0].localeCompare(a[0]));
+    renderHomeSeries();
+  }
+
+  function buildMetricDays(metric, records, dateWindow, target) {
+    target.clear();
+    const items = records.filter(record => record.engagement_type === metric).sort((a, b) => b.time - a.time);
+    const rangedItems = items.filter(item => !dateWindow || (item.time >= dateWindow.start && item.time <= dateWindow.end));
+    for (const item of rangedItems) {
+      const day = item.time ? new Date(item.time).toISOString().slice(0, 10) : "No date";
+      const current = target.get(day) || { verified: 0, unverified: 0, unknown: 0, items: [] };
+      if (item.verified === true) current.verified += item.amount;
+      else if (item.verified === false) current.unverified += item.amount;
+      else current.unknown += item.amount;
+      current.items.push(item);
+      target.set(day, current);
+    }
+    if (dateWindow) {
+      for (let cursor = new Date(dateWindow.start); cursor <= dateWindow.end; cursor.setUTCDate(cursor.getUTCDate() + 1)) {
+        const day = cursor.toISOString().slice(0, 10);
+        if (!target.has(day)) target.set(day, { verified: 0, unverified: 0, unknown: 0, items: [] });
+      }
+    }
+    return rangedItems;
+  }
+
+  function renderHomeSeries() {
+    if (!isAccountOverviewPage()) {
+      cleanupCustomChartArtifacts();
+      chartState = null;
+      return;
+    }
+    let activeSlots = selectedExtraBySlot.map((metric, slot) => metric ? { metric, slot } : null).filter(Boolean);
+    if (!homeEnabled || !activeSlots.length) {
+      clearReplacement();
+      chartState = null;
+      return;
+    }
+    const svg = document.querySelector("main .recharts-wrapper svg.recharts-surface");
+    if (!svg) return;
+    svg.querySelectorAll(".xat-home-linger-series").forEach(group => group.remove());
+    svg.querySelectorAll(".xat-replaced-native").forEach(group => group.classList.remove("xat-replaced-native"));
+    const wrapper = svg.parentElement;
+    const nativeGroups = svg.querySelectorAll("g.recharts-layer.recharts-bar");
+    const orphanedSlots = activeSlots.filter(({ slot }) => {
+      if (nativeGroups[slot]) return false;
+      const triggerText = getMetricTriggers()[slot]?.textContent.trim();
+      return !["None", "Select secondary metric"].includes(triggerText);
+    });
+    if (orphanedSlots.length) {
+      for (const { slot } of orphanedSlots) {
+        selectedExtraBySlot[slot] = null;
+        setMetricTriggerLabel(getMetricTriggers()[slot], "None");
+      }
+      activeSlots = activeSlots.filter(({ slot }) => nativeGroups[slot]);
+      clearReplacement();
+      chartState = null;
+      if (!activeSlots.length) return;
+    }
+    if (!chartState || chartState.svg !== svg) {
+      chartState?.groups?.forEach(group => group.remove());
+      chartState = { svg, wrapper, groups: [], axisLabels: new Map(), axisMaxBySlot: [1, 1] };
+    }
+    chartState.groups?.forEach(group => group.remove());
+    chartState.groups = [];
+    const period = getChartPeriod();
+    const primaryChartMap = aggregateMetricMap(days, period);
+    const chartMaps = new Map([["__primary__", primaryChartMap]]);
+    const sorted = [...primaryChartMap.keys()].filter(day => day !== "No date").sort();
+    if (!sorted.length) return;
+    chartState.chartDays = sorted;
+    const layout = getNativeLayout(svg, sorted.length);
+    if (!layout) return;
+    for (const { metric, slot } of activeSlots) {
+      const metricMap = metricDays.get(metric) || days;
+      const chartMap = aggregateMetricMap(metricMap, period);
+      chartMaps.set(metric, chartMap);
+      const values = sorted.map(day => {
+        const data = chartMap.get(day) || { verified: 0, unverified: 0, unknown: 0 };
+        return verifiedOnly ? data.verified : data.verified + data.unverified + data.unknown;
+      });
+      const axisMax = niceAxisMax(Math.max(...values, 1));
+      const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      group.setAttribute("class", "xat-home-linger-series");
+      group.setAttribute("aria-label", `${humanMetricName(metric)}${verifiedOnly ? " Verified" : ""}`);
+      const color = slot === 0 ? "#1d9bf0" : "#00ba7c";
+      if (nativeGroups[slot]) nativeGroups[slot].classList.add("xat-replaced-native");
+      const totalWidth = layout.seriesCount * layout.barWidth + (layout.seriesCount - 1) * layout.gap;
+      values.forEach((value, index) => {
+        const slotStart = layout.left + layout.slot * index + (layout.slot - totalWidth) / 2;
+        const x = slotStart + slot * (layout.barWidth + layout.gap);
+        const height = value ? Math.max(3, Math.min(layout.plotHeight, value / axisMax * layout.plotHeight)) : 0;
+        const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+        rect.setAttribute("class", "xat-home-linger-bar");
+        rect.setAttribute("fill", color);
+        rect.setAttribute("x", String(x));
+        rect.setAttribute("y", String(layout.bottom - height));
+        rect.setAttribute("width", String(layout.barWidth));
+        rect.setAttribute("height", String(height));
+        rect.setAttribute("rx", "2");
+        rect.setAttribute("data-day", sorted[index]);
+        rect.setAttribute("data-value", String(value));
+        rect.style.setProperty("--xat-series-color", color);
+        rect.appendChild(document.createElementNS("http://www.w3.org/2000/svg", "title")).textContent = `${sorted[index]} · ${humanMetricName(metric)}: ${formatNumber(value)}`;
+        group.appendChild(rect);
+      });
+      svg.appendChild(group);
+      chartState.groups.push(group);
+      chartState.metricMaps = chartMaps;
+      chartState.period = period;
+      chartState.axisMaxBySlot[slot] = axisMax;
+      updateReplacementAxis(svg, axisMax, slot);
+    }
+    updateReplacementTrigger();
+    installTooltipBridge(svg, wrapper);
+  }
+
+  function updateReplacementTrigger() {
+    const triggers = getMetricTriggers();
+    selectedExtraBySlot.forEach((metric, slot) => {
+      if (!metric) return;
+      const trigger = triggers[slot];
+      if (trigger && trigger.textContent.trim() !== humanMetricName(metric)) {
+        setMetricTriggerLabel(trigger, humanMetricName(metric));
+      }
+    });
+  }
+
+  function getMetricTriggers() {
+    const candidates = [...document.querySelectorAll('[role="combobox"]')].filter(isVisible);
+    return candidates.slice(0, 2);
+  }
+
+  function isMetricMenuOpen(trigger) {
+    const id = trigger?.getAttribute("aria-controls");
+    return Boolean(
+      trigger?.getAttribute("aria-expanded") === "true" ||
+      (id && document.getElementById(id)?.getAttribute("role") === "listbox")
+    );
+  }
+
+  function bindCustomMetricTriggerRecovery() {
+    getMetricTriggers().forEach((trigger, slot) => {
+      if (trigger.dataset.xatCustomTriggerBound) return;
+      trigger.dataset.xatCustomTriggerBound = "true";
+      trigger.addEventListener("pointerdown", () => {
+        // Replacing the visible Radix label leaves X's internal Select value
+        // native. In that state X can consume the first click (and sometimes
+        // the second) without leaving its menu open. Retry only if the menu
+        // is still closed, so normal native Select behaviour is untouched.
+        if (!selectedExtraBySlot[slot] || trigger.dataset.xatOpeningRecovery) return;
+        let attempts = 0;
+        const recover = () => {
+          if (isMetricMenuOpen(trigger) || attempts++ >= 2) return;
+          if (attempts === 1) {
+            // Radix's keyboard path is deterministic here: unlike the
+            // pointer path it does not spend a click just restoring focus
+            // after we have replaced the visible value.
+            trigger.focus({ preventScroll: true });
+            trigger.dispatchEvent(new KeyboardEvent("keydown", {
+              key: "ArrowDown", code: "ArrowDown", bubbles: true, cancelable: true
+            }));
+            setTimeout(recover, 45);
+            return;
+          }
+          trigger.dataset.xatOpeningRecovery = "true";
+          trigger.dispatchEvent(new PointerEvent("pointerdown", {
+            bubbles: true, cancelable: true, view: window, pointerId: 1, isPrimary: true
+          }));
+          trigger.dispatchEvent(new PointerEvent("pointerup", {
+            bubbles: true, cancelable: true, view: window, pointerId: 1, isPrimary: true
+          }));
+          trigger.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+          trigger.dataset.xatOpeningRecovery = "";
+          setTimeout(recover, 90);
+        };
+        setTimeout(recover, 90);
+      }, true);
+    });
+  }
+
+  function setMetricTriggerLabel(trigger, text) {
+    const span = trigger?.querySelector("span");
+    if (span) span.textContent = text;
+  }
+
+  function clearReplacement() {
+    chartState?.groups?.forEach(group => group.remove());
+    chartState?.svg?.querySelectorAll(".xat-replaced-native").forEach(group => group.classList.remove("xat-replaced-native"));
+    chartState?.svg?.querySelectorAll(".xat-custom-axis-labels").forEach(group => group.remove());
+    chartState?.svg?.querySelectorAll(".xat-generated-axis-labels").forEach(group => group.remove());
+    if (chartState?.svg && chartState.axisLabels) {
+      for (const [labelGroup, labels] of chartState.axisLabels) {
+        getAxisTicks(labelGroup).forEach((tick, index) => {
+          tick.style.visibility = "visible";
+          if (labels[index] !== undefined) tick.textContent = labels[index];
+        });
+      }
+    }
+  }
+
+  function cleanupCustomChartArtifacts() {
+    document.querySelectorAll(".xat-home-linger-series, .xat-custom-axis-labels, .xat-generated-axis-labels").forEach(node => node.remove());
+    document.querySelectorAll(".xat-replaced-native").forEach(node => node.classList.remove("xat-replaced-native"));
+  }
+
+  function isAccountOverviewPage() {
+    return location.pathname === "/i/account_analytics" || /^\/i\/account_analytics\/overview\/?$/.test(location.pathname);
+  }
+
+  function updateReplacementAxis(svg, max, slot) {
+    let labelGroup = getAxisLabelGroups(svg)[slot];
+    // When the native chart has only one series (the None state), X does not
+    // render a secondary y-axis at all. Create the same Recharts label group
+    // shape at the right plot edge so the custom series has a real aligned
+    // scale instead of bars floating without an axis.
+    if (!labelGroup && slot === 1) {
+      const leftGroup = getAxisLabelGroups(svg)[0];
+      if (leftGroup) {
+        labelGroup = leftGroup.cloneNode(true);
+        labelGroup.classList.add("xat-generated-axis-labels");
+        const rightX = Math.max(0, Number(svg.getAttribute("width")) - 30);
+        labelGroup.querySelectorAll("text, tspan").forEach(node => {
+          node.setAttribute("x", String(rightX));
+          node.setAttribute("text-anchor", "start");
+          node.setAttribute("orientation", "right");
+        });
+        svg.appendChild(labelGroup);
+      }
+    }
+    if (!labelGroup) return;
+    const axisTicks = getAxisTicks(labelGroup);
+    if (chartState && !chartState.axisLabels.has(labelGroup)) {
+      chartState.axisLabels.set(labelGroup, axisTicks.map(tick => tick.textContent));
+    }
+    const ticks = axisTicks;
+    const niceMax = niceAxisMax(max);
+    labelGroup.querySelector(".xat-custom-axis-labels")?.remove();
+    const labelsGroup = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    labelsGroup.setAttribute("class", "xat-custom-axis-labels");
+    labelsGroup.style.pointerEvents = "none";
+    const yPositions = ticks.map(tick => Number(tick.getAttribute("y")));
+    const finiteY = yPositions.filter(Number.isFinite);
+    const topY = finiteY.length ? Math.min(...finiteY) : 0;
+    const bottomY = finiteY.length ? Math.max(...finiteY) : Math.max(1, ticks.length - 1);
+    ticks.forEach((tick, index) => {
+      const y = yPositions[index];
+      const ratio = Number.isFinite(y)
+        ? (bottomY - y) / Math.max(1, bottomY - topY)
+        : index / Math.max(1, ticks.length - 1);
+      const value = niceMax * Math.max(0, Math.min(1, ratio));
+      const label = formatAxisNumber(value);
+      if (tick.textContent !== label) tick.textContent = label;
+      const replacement = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      for (const attribute of ["x", "y", "dx", "dy", "text-anchor", "dominant-baseline"]) {
+        const raw = tick.getAttribute(attribute);
+        if (raw !== null) replacement.setAttribute(attribute, raw);
+      }
+      replacement.setAttribute("class", "xat-custom-axis-label");
+      replacement.setAttribute("fill", slot === 0 ? "#1d9bf0" : "#00ba7c");
+      replacement.textContent = label;
+      labelsGroup.appendChild(replacement);
+      tick.style.visibility = "hidden";
+    });
+    labelGroup.appendChild(labelsGroup);
+  }
+
+  function getAxisTicks(axis) {
+    return [...axis.querySelectorAll("text")].filter(tick => !tick.closest(".xat-custom-axis-labels"));
+  }
+
+  function getAxisLabelGroups(svg) {
+    return [...svg.querySelectorAll("g.recharts-yAxis-tick-labels")].slice(0, 2);
+  }
+
+  function getYAxisForSlot(svg, slot) {
+    const axes = [...svg.querySelectorAll(".recharts-yAxis")];
+    if (axes.length < 2) return axes[0];
+    const positioned = axes.map(axis => {
+      const ctmX = axis.getCTM?.()?.e;
+      const transform = axis.getAttribute("transform") || "";
+      const translatedX = Number(transform.match(/translate\(\s*(-?\d+(?:\.\d+)?)/)?.[1]);
+      const xs = getAxisTicks(axis).map(tick => Number(tick.getAttribute("x"))).filter(Number.isFinite);
+      const x = Number.isFinite(ctmX) ? ctmX : Number.isFinite(translatedX) ? translatedX : xs.length ? xs.reduce((sum, value) => sum + value, 0) / xs.length : 0;
+      return { axis, x };
+    }).sort((a, b) => a.x - b.x);
+    return positioned[slot]?.axis || axes[slot];
+  }
+
+  function niceAxisMax(value) {
+    const safe = Math.max(Number(value) || 0, 1);
+    const power = 10 ** Math.floor(Math.log10(safe));
+    const fraction = safe / power;
+    const step = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10;
+    return step * power;
+  }
+
+  function formatAxisNumber(value) {
+    return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(value);
+  }
+
+  function injectExtraMetricOptions() {
+    if (!isAccountOverviewPage()) return;
+    const viewport = document.querySelector('[role="listbox"] [data-radix-select-viewport]');
+    if (!viewport || !extraMetrics.size) return;
+    const slot = getOpenMetricSlot(viewport);
+    if (slot < 0) {
+      viewport.querySelectorAll(".xat-extra-option").forEach(option => option.remove());
+      return;
+    }
+    const nativeLabels = new Set([...viewport.querySelectorAll('[role="option"]:not(.xat-extra-option)')].map(option => option.textContent.trim()));
+    for (const option of viewport.querySelectorAll('[role="option"]:not(.xat-extra-option)')) {
+      if (option.dataset.xatNativeBound) continue;
+      option.dataset.xatNativeBound = "true";
+      const resetNativeSlot = () => {
+        if (slot >= 0 && slot < 2) selectedExtraBySlot[slot] = null;
+        replacementSlot = null;
+        clearReplacement();
+        cleanupCustomChartArtifacts();
+        chartState = null;
+        setTimeout(() => {
+          if (slot < 0 || selectedExtraBySlot[slot]) return;
+          setMetricTriggerLabel(getMetricTriggers()[slot], option.textContent.trim());
+        }, 0);
+      };
+      // Radix commits Select values on pointerdown. Binding click as well made
+      // each change tear down and rebuild the chart twice.
+      option.addEventListener("pointerdown", resetNativeSlot, true);
+    }
+    for (const [metric, metricLabel] of extraMetrics) {
+      if (!isExtraMetric(metric) || !hasEnoughHistory(metric)) continue;
+      if (!metric || nativeLabels.has(metricLabel) || viewport.querySelector(`[data-xat-extra-metric="${CSS.escape(metric)}"]`)) continue;
+      const option = document.createElement("div");
+      option.className = "xat-extra-option relative flex w-full cursor-pointer select-none items-center rounded-xs py-1.5 pl-8 pr-2 text-sm outline-hidden";
+      option.setAttribute("role", "option");
+      option.setAttribute("tabindex", "-1");
+      option.dataset.xatExtraMetric = metric;
+      option.innerHTML = `<span class="xat-extra-check absolute left-2 flex h-3.5 w-3.5 items-center justify-center"></span><span>${escapeHtml(metricLabel)}</span>`;
+      const selectExtraMetric = event => {
+        // Radix emits pointerdown followed by click. Handle the selection once;
+        // rendering twice can close the next metric menu before it opens.
+        if (option.dataset.xatSelecting === "true") return;
+        option.dataset.xatSelecting = "true";
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        const triggerText = getMetricTriggers()[slot]?.textContent.trim();
+        if (["None", "Select secondary metric"].includes(triggerText)) {
+          viewport.closest('[role="listbox"]')?.remove();
+          showSelectionNotice("Choose a native metric first");
+          return;
+        }
+        replacementSlot = slot >= 0 ? slot : 0;
+        if (replacementSlot > 1) replacementSlot = 0;
+        extraMetric = metric;
+        const nativeGroups = document.querySelectorAll("main .recharts-wrapper svg.recharts-surface g.recharts-layer.recharts-bar");
+        if (!nativeGroups[replacementSlot]) {
+          const fallbackLabel = replacementSlot === 0 ? "Impressions" : "Engagements";
+          const fallback = [...viewport.querySelectorAll('[role="option"]')].find(nativeOption => nativeOption.textContent.trim() === fallbackLabel);
+          if (fallback) {
+            fallback.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, view: window, pointerId: 1, isPrimary: true }));
+            fallback.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, cancelable: true, view: window, pointerId: 1, isPrimary: true }));
+            fallback.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+          }
+          viewport.closest('[role="listbox"]')?.remove();
+          let attempts = 0;
+          const waitForNativeSlot = () => {
+            const groups = document.querySelectorAll("main .recharts-wrapper svg.recharts-surface g.recharts-layer.recharts-bar");
+            if (groups[replacementSlot] || attempts++ > 12) {
+              selectedExtraBySlot[replacementSlot] = metric;
+              render(lastMessage || { items: [] });
+              return;
+            }
+            setTimeout(waitForNativeSlot, 100);
+          };
+          setTimeout(waitForNativeSlot, 100);
+          return;
+        }
+        viewport.closest('[role="listbox"]')?.remove();
+        selectedExtraBySlot[replacementSlot] = metric;
+        render(lastMessage || { items: [] });
+      };
+      // Radix selects native items on pointerdown. Capture that single event so
+      // the custom option cannot fall through to a native item underneath it.
+      option.addEventListener("pointerdown", selectExtraMetric, true);
+      viewport.appendChild(option);
+    }
+    const selected = selectedExtraBySlot[slot];
+    for (const option of viewport.querySelectorAll('[role="option"]')) {
+      const isCustom = option.classList.contains("xat-extra-option");
+      const isSelected = isCustom && option.dataset.xatExtraMetric === selected;
+      option.setAttribute("aria-selected", isSelected ? "true" : "false");
+      if (isCustom) {
+        const check = option.querySelector(".xat-extra-check");
+        if (check) check.textContent = isSelected ? "✓" : "";
+      } else if (selected) {
+        option.setAttribute("data-state", "unchecked");
+        option.setAttribute("aria-checked", "false");
+        option.setAttribute("data-highlighted", "false");
+        option.dataset.xatNativeUnselected = "true";
+        option.style.setProperty("background-color", "transparent", "important");
+        const indicator = option.querySelector('[data-radix-select-item-indicator]');
+        if (indicator) indicator.style.visibility = "hidden";
+        option.querySelectorAll("svg").forEach(icon => { icon.style.visibility = "hidden"; });
+      }
+    }
+  }
+
+  function getOpenMetricSlot(viewport) {
+    const triggers = [...document.querySelectorAll('[role="combobox"]')].filter(isVisible);
+    const listbox = viewport.closest('[role="listbox"]');
+    const listboxId = listbox?.id;
+    const linked = triggers.findIndex(trigger => listboxId && trigger.getAttribute("aria-controls") === listboxId);
+    const slot = linked >= 0 ? linked : triggers.findIndex(trigger => trigger.getAttribute("aria-expanded") === "true");
+    // The third combobox is X's chart-mode picker. It uses the same Radix
+    // listbox markup, so guard it explicitly before adding metric options.
+    const triggerText = slot >= 0 ? triggers[slot]?.textContent.trim() : "";
+    const nonMetricValues = new Set(["Bar", "Line", "Daily", "Weekly", "Pay period", "Monthly"]);
+    if (nonMetricValues.has(triggerText)) return -1;
+    return slot;
+  }
+
+  function getNativeLayout(svg, count) {
+    const grid = svg.querySelector(".recharts-cartesian-grid-horizontal line");
+    if (!grid) return null;
+    const x1 = Number(grid.getAttribute("x1"));
+    const x2 = Number(grid.getAttribute("x2"));
+    const gridLines = [...svg.querySelectorAll(".recharts-cartesian-grid-horizontal line")];
+    const yValues = gridLines.flatMap(line => [Number(line.getAttribute("y1")), Number(line.getAttribute("y2"))]).filter(Number.isFinite);
+    const top = Math.min(...yValues);
+    const bottom = Math.max(...yValues);
+    const firstAxisLabels = getAxisLabelGroups(svg)[0];
+    const yTicks = firstAxisLabels ? getAxisTicks(firstAxisLabels).map(tick => parseCompact(tick.textContent.trim())) : [];
+    const series = [...svg.querySelectorAll("g.recharts-layer.recharts-bar")]
+      .map(group => [...group.querySelectorAll(".recharts-rectangle")]
+        .map(rect => ({
+          x: Number(rect.getAttribute("x")),
+          width: Number(rect.getAttribute("width")),
+        }))
+        .filter(rect => Number.isFinite(rect.x) && Number.isFinite(rect.width)))
+      .filter(group => group.length);
+    const firstSeries = series[0] || [];
+    const barWidth = Math.max(8, Math.min(34, firstSeries[0]?.width || ((x2 - x1) / count) * .22));
+    const nativeXs = firstSeries.map(rect => rect.x);
+    const nativeGap = series[1]?.[0] ? series[1][0].x - firstSeries[0].x - barWidth : barWidth * .25;
+    return {
+      left: x1,
+      slot: (x2 - x1) / count,
+      bottom,
+      plotHeight: bottom - top,
+      max: Math.max(...yTicks.filter(Number.isFinite), 1),
+      barWidth,
+      nativeXs,
+      nativeXsBySeries: series.map(group => group.map(rect => rect.x)),
+      gap: Math.max(2, nativeGap),
+      seriesCount: Math.max(1, series.length),
+    };
+  }
+
+  function installTooltipBridge(svg, wrapper) {
+    if (svg.dataset.xatTooltipBound) return;
+    svg.dataset.xatTooltipBound = "true";
+    svg.addEventListener("mousemove", event => {
+      if (!homeEnabled || !chartState?.groups?.length) return;
+      const rect = svg.getBoundingClientRect();
+      const viewBox = svg.viewBox.baseVal;
+      const x = (event.clientX - rect.left) / rect.width * viewBox.width;
+      const daysList = chartState?.chartDays || [...days.keys()].filter(day => day !== "No date").sort();
+      const grid = svg.querySelector(".recharts-cartesian-grid-horizontal line");
+      if (!grid || !daysList.length) return;
+      const left = Number(grid.getAttribute("x1"));
+      const right = Number(grid.getAttribute("x2"));
+      const index = Math.max(0, Math.min(daysList.length - 1, Math.floor((x - left) / ((right - left) / daysList.length))));
+      hoverDay = daysList[index];
+      if (!tooltipFrame) {
+        tooltipFrame = requestAnimationFrame(() => {
+          tooltipFrame = 0;
+          decorateNativeTooltip(wrapper);
+        });
+      }
+    }, true);
+  }
+
+  function decorateNativeTooltip(wrapper) {
+    const tooltip = wrapper.querySelector(".recharts-tooltip-wrapper");
+    if (!tooltip || !hoverDay || getComputedStyle(tooltip).visibility === "hidden") return;
+    const content = tooltip.firstElementChild || tooltip;
+    const rowsHost = content.querySelector("div.grid") || content;
+    const nativeRows = [...rowsHost.children].filter(row => !row.classList.contains("xat-home-tooltip-row"));
+    selectedExtraBySlot.forEach((metric, slot) => {
+      if (!metric) return;
+      const replacement = nativeRows[slot];
+      if (!replacement) return;
+      const label = replacement.querySelector("span.text-gray-600");
+      const value = replacement.querySelector("span.text-text");
+      const swatch = replacement.querySelector("div.shrink-0");
+      if (label) label.textContent = humanMetricName(metric);
+      if (value) value.textContent = formatNumber(getDayValue(hoverDay, metric));
+      if (swatch) swatch.style.backgroundColor = slot === 0 ? "#1d9bf0" : "#00ba7c";
+    });
+  }
+
+  function getDayValue(day, metric = extraMetric) {
+    const chartMap = chartState?.metricMaps?.get(metric) || aggregateMetricMap(metricDays.get(metric) || days, getChartPeriod());
+    const data = chartMap.get(day);
+    if (!data) return 0;
+    return verifiedOnly ? data.verified : data.verified + data.unverified + data.unknown;
+  }
+
+  function getChartPeriod() {
+    const controls = [...document.querySelectorAll('[role="combobox"]')].filter(isVisible);
+    return controls[2]?.textContent.trim() || "Daily";
+  }
+
+  function aggregateMetricMap(source, period) {
+    if (period === "Daily") return new Map(source);
+    const result = new Map();
+    for (const [day, data] of source.entries()) {
+      if (day === "No date") continue;
+      const bucket = getPeriodBucket(day, period);
+      const current = result.get(bucket) || { verified: 0, unverified: 0, unknown: 0, items: [] };
+      current.verified += data.verified;
+      current.unverified += data.unverified;
+      current.unknown += data.unknown;
+      current.items.push(...(data.items || []));
+      result.set(bucket, current);
+    }
+    return result;
+  }
+
+  function getPeriodBucket(day, period) {
+    const date = new Date(`${day}T00:00:00Z`);
+    if (period === "Monthly") return `${day.slice(0, 7)}-01`;
+    if (period === "Pay period") {
+      const year = date.getUTCFullYear();
+      const month = date.getUTCMonth();
+      const start = date.getUTCDate() >= 12 && date.getUTCDate() < 26 ? 12 : 26;
+      const bucketMonth = date.getUTCDate() < 12 ? month - 1 : month;
+      return toInputDate(new Date(Date.UTC(year, bucketMonth, start)));
+    }
+    if (period === "Weekly") {
+      const dayOfWeek = date.getUTCDay();
+      date.setUTCDate(date.getUTCDate() + (7 - dayOfWeek) % 7);
+      return toInputDate(date);
+    }
+    return day;
+  }
+
+  function getDateWindow() {
+    const rangeKey = pendingRangeKey || getActiveRangeKey() || selectedRangeKey || "7D";
+    const length = { "7D": 7, "2W": 14, "4W": 28, "3M": 90, "1Y": 365 }[rangeKey] || 7;
+    const end = new Date();
+    end.setUTCHours(0, 0, 0, 0);
+    const start = new Date(end);
+    start.setUTCDate(start.getUTCDate() - length + 1);
+    return { start, end };
+  }
+
+  function watchVerifiedButton() {
+    const button = [...document.querySelectorAll("button")].find(button => {
+      const label = button.getAttribute("aria-label") || button.textContent.trim();
+      return (/^Verified$/.test(label) || label === "Verified only") && isVisible(button);
+    });
+    if (!button || button.dataset.xatVerifiedBound) return;
+    button.dataset.xatVerifiedBound = "true";
+    verifiedOnly = button.getAttribute("aria-pressed") === "true";
+    button.addEventListener("click", () => setTimeout(() => {
+      verifiedOnly = button.getAttribute("aria-pressed") === "true";
+      renderHomeSeries();
+    }, 0), true);
+  }
+
+  function watchRangeButtons() {
+    for (const button of getRangeControls()) {
+      if (button.dataset.xatRangeBound) continue;
+      button.dataset.xatRangeBound = "true";
+      button.addEventListener("click", () => {
+        selectedRangeKey = getRangeKey(button);
+        pendingRangeKey = selectedRangeKey;
+        const requestId = ++rangeRequestId;
+        clearTimeout(rangeWaitTimer);
+        clearReplacement();
+        chartState = null;
+        const startedAt = Date.now();
+        const waitForNativeRange = () => {
+          if (requestId !== rangeRequestId) return;
+          const active = getActiveRangeKey();
+          if (active === selectedRangeKey || Date.now() - startedAt > 1800) {
+            pendingRangeKey = "";
+            if (lastMessage) render(lastMessage);
+            return;
+          }
+          rangeWaitTimer = setTimeout(waitForNativeRange, 50);
+        };
+        rangeWaitTimer = setTimeout(waitForNativeRange, 50);
+      }, true);
+    }
+  }
+
+  function watchChartPeriod() {
+    const control = [...document.querySelectorAll('[role="combobox"]')].filter(isVisible)[2];
+    if (!control || control.dataset.xatPeriodBound) return;
+    control.dataset.xatPeriodBound = "true";
+    control.addEventListener("click", () => setTimeout(() => {
+      if (selectedExtraBySlot.some(Boolean)) renderHomeSeries();
+    }, 250), true);
+  }
+
+  function getRangeControls() {
+    return [...document.querySelectorAll("button,[role=button]")].filter(button =>
+      !button.closest("#xat-advanced-view") && isVisible(button) && getRangeKey(button));
+  }
+
+  function getActiveRangeKey() {
+    const active = getRangeControls().find(button =>
+      button.getAttribute("aria-pressed") === "true" ||
+      button.getAttribute("aria-checked") === "true" ||
+      button.getAttribute("data-state") === "on" ||
+      button.className.includes("bg-text"));
+    return getRangeKey(active);
+  }
+
+  function getRangeKey(button) {
+    if (!button) return "";
+    const text = [button.textContent, button.getAttribute("aria-label"), button.getAttribute("title")]
+      .filter(Boolean).join(" ").replace(/\s+/g, " ").trim().toUpperCase();
+    const exact = text.match(/\b(7D|2W|4W|3M|1Y)\b/);
+    if (exact) return exact[1];
+    if (/\b(7\s*DAYS?|ONE\s*WEEK)\b/.test(text)) return "7D";
+    if (/\b(2\s*WEEKS?)\b/.test(text)) return "2W";
+    if (/\b(4\s*WEEKS?)\b/.test(text)) return "4W";
+    if (/\b(3\s*MONTHS?)\b/.test(text)) return "3M";
+    if (/\b(1\s*YEAR)\b/.test(text)) return "1Y";
+    return "";
+  }
+
+  function isVisible(element) {
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function getTimestamp(item) {
+    const raw = item.timestamp ?? item.created_at ?? item.date;
+    if (raw === undefined || raw === null || raw === "") return 0;
+    if (raw && typeof raw === "object") return getTimestamp({ timestamp: raw.iso8601_time ?? raw.iso8601 ?? raw.timestamp });
+    if (typeof raw === "number") return raw < 100000000000 ? raw * 1000 : raw;
+    const parsed = Date.parse(String(raw));
+    if (!Number.isNaN(parsed)) return parsed;
+    const numeric = Number(raw);
+    return Number.isFinite(numeric) ? (numeric < 100000000000 ? numeric * 1000 : numeric) : 0;
+  }
+
+  function getVerified(item) {
+    const raw = item.is_engaging_user_verified;
+    if (typeof raw === "boolean") return raw;
+    if (raw === "true" || raw === "false") return raw === "true";
+    return null;
+  }
+
+  function getAmount(item) {
+    const number = Number(item.count);
+    return Number.isFinite(number) ? number : 0;
+  }
+
+  function parseCompact(value) {
+    const match = String(value).replace(/,/g, "").match(/^([\d.]+)([KMB])?$/i);
+    if (!match) return Number(value);
+    return Number(match[1]) * ({ k: 1e3, m: 1e6, b: 1e9 }[String(match[2] || "").toLowerCase()] || 1);
+  }
+
+  function formatNumber(value) {
+    return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(value);
+  }
+
+  function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[char]));
+  }
+
+  function escapeAttr(value) {
+    return escapeHtml(value).replace(/`/g, "&#96;");
+  }
+
+  window.addEventListener("message", event => {
+    if (event.source === window && event.data?.source === MESSAGE) render(event.data);
+  });
+  const observer = new MutationObserver(() => {
+    if (maintenanceFrame) return;
+    maintenanceFrame = requestAnimationFrame(() => {
+      maintenanceFrame = 0;
+      if (!isAccountOverviewPage()) {
+        cleanupCustomChartArtifacts();
+        if (root) root.hidden = true;
+        chartState = null;
+        return;
+      }
+      if (root) root.hidden = false;
+      watchVerifiedButton();
+      watchRangeButtons();
+      watchChartPeriod();
+      bindCustomMetricTriggerRecovery();
+      injectExtraMetricOptions();
+      updateReplacementTrigger();
+      syncAdvancedButton();
+      if (chartState?.svg?.isConnected && chartState.axisMaxBySlot) {
+        selectedExtraBySlot.forEach((metric, slot) => {
+          if (metric) updateReplacementAxis(chartState.svg, chartState.axisMaxBySlot[slot], slot);
+        });
+      }
+      const periodChanged = chartState?.period && chartState.period !== getChartPeriod();
+      if (homeEnabled && (periodChanged || !chartState?.groups?.some(group => group.isConnected) || !document.querySelector("main .recharts-wrapper svg.recharts-surface"))) renderHomeSeries();
+    });
+  });
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+  window.addEventListener("resize", () => {
+    renderHomeSeries();
+    const view = document.querySelector("#xat-advanced-view:not([hidden])");
+    if (view) positionAdvancedView(view);
+  });
+  window.addEventListener("scroll", () => {
+    const view = document.querySelector("#xat-advanced-view:not([hidden])");
+    if (view) positionAdvancedView(view);
+  }, { passive: true });
+  ensurePanel();
+  watchVerifiedButton();
+  watchRangeButtons();
+  watchChartPeriod();
+  chrome.storage.local.get({ records: [] }, data => {
+    if (Array.isArray(data.records) && data.records.length) render({ items: data.records });
+  });
+})();
