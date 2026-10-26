@@ -2,7 +2,6 @@
 .xat-home-linger-series { pointer-events: none; }
 .xat-home-linger-series rect { fill: var(--xat-series-color); }
 .xat-custom-axis-label {
-  font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   pointer-events: none;
 }
 .xat-replaced-native { opacity: 0; pointer-events: none; }
@@ -20,3 +19,13 @@
   font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 #xat-selection-notice[hidden] { display: none; }
+
+/* Match X's native select rows; keep the checkmark in the trailing column. */
+.xat-extra-option { display: flex; align-items: center; gap: 12px; cursor: pointer; }
+.xat-extra-label { flex: 1; }
+.xat-extra-check { width: 1em; height: 1em; flex: none; visibility: hidden; }
+.xat-extra-option[aria-selected="true"] .xat-extra-check { visibility: visible; }
+.xat-extra-option:not([aria-disabled="true"]):is(:hover, :focus) { background: var(--x-hover-subtle, rgb(127 127 127 / 12%)); outline: none; }
+.xat-extra-option[aria-disabled="true"] { opacity: .5; cursor: default; }
+.xat-native-selection-replaced [data-icon="icon-checkmark"],
+.xat-native-selection-replaced [data-radix-select-item-indicator] { visibility: hidden; }

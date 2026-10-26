@@ -76,7 +76,6 @@
   let root;
   let homeEnabled = true;
   let extraMetric = "HomeLinger";
-  let replacementSlot = null;
   const selectedExtraBySlot = [null, null];
   let verifiedOnly = false;
   let lastMessage;
@@ -452,7 +451,8 @@
     svg.querySelectorAll(".xat-home-linger-series").forEach(group => group.remove());
     svg.querySelectorAll(".xat-replaced-native").forEach(group => group.classList.remove("xat-replaced-native"));
     const wrapper = svg.parentElement;
-    const nativeGroups = svg.querySelectorAll("g.recharts-layer.recharts-bar");
+    const lineMode = Boolean(svg.querySelector("g.recharts-line"));
+    const nativeGroups = svg.querySelectorAll("g.recharts-layer.recharts-bar, g.recharts-layer.recharts-line");
     const orphanedSlots = activeSlots.filter(({ slot }) => {
       if (nativeGroups[slot]) return false;
       const triggerText = getMetricTriggers()[slot]?.textContent.trim();
@@ -496,10 +496,22 @@
       group.setAttribute("aria-label", `${humanMetricName(metric)}${verifiedOnly ? " Verified" : ""}`);
       const color = slot === 0 ? "#1d9bf0" : "#00ba7c";
       if (nativeGroups[slot]) nativeGroups[slot].classList.add("xat-replaced-native");
+      group.dataset.xatSlot = String(slot);
       const totalWidth = layout.seriesCount * layout.barWidth + (layout.seriesCount - 1) * layout.gap;
-      values.forEach((value, index) => {
+      if (lineMode) {
+        const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        path.setAttribute("d", values.map((value, index) => {
+          const x = layout.left + layout.slot * sorted.length * index / Math.max(1, sorted.length - 1);
+          const y = layout.bottom - value / axisMax * layout.plotHeight;
+          return `${index ? "L" : "M"}${x},${y}`;
+        }).join(" "));
+        path.setAttribute("fill", "none");
+        path.setAttribute("stroke", color);
+        path.setAttribute("stroke-width", "2");
+        group.appendChild(path);
+      } else values.forEach((value, index) => {
         const slotStart = layout.left + layout.slot * index + (layout.slot - totalWidth) / 2;
-        const x = slotStart + slot * (layout.barWidth + layout.gap);
+        const x = layout.nativeXsBySeries[slot]?.[index] ?? (slotStart + slot * (layout.barWidth + layout.gap));
         const height = value ? Math.max(3, Math.min(layout.plotHeight, value / axisMax * layout.plotHeight)) : 0;
         const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
         rect.setAttribute("class", "xat-home-linger-bar");
@@ -519,9 +531,11 @@
       chartState.groups.push(group);
       chartState.metricMaps = chartMaps;
       chartState.period = period;
+      chartState.lineMode = lineMode;
       chartState.axisMaxBySlot[slot] = axisMax;
       updateReplacementAxis(svg, axisMax, slot);
     }
+    chartState.layoutSignature = getChartLayoutSignature(svg);
     updateReplacementTrigger();
     installTooltipBridge(svg, wrapper);
   }
@@ -646,9 +660,14 @@
     }
     const ticks = axisTicks;
     const niceMax = niceAxisMax(max);
-    labelGroup.querySelector(".xat-custom-axis-labels")?.remove();
+    const signature = JSON.stringify([niceMax, slot, ticks.map(tick =>
+      ["x", "y", "dx", "dy", "text-anchor"].map(name => tick.getAttribute(name)))]);
+    const existingLabels = labelGroup.querySelector(".xat-custom-axis-labels");
+    if (existingLabels?.dataset.xatSignature === signature && ticks.every(tick => tick.style.visibility === "hidden")) return;
+    existingLabels?.remove();
     const labelsGroup = document.createElementNS("http://www.w3.org/2000/svg", "g");
     labelsGroup.setAttribute("class", "xat-custom-axis-labels");
+    labelsGroup.dataset.xatSignature = signature;
     labelsGroup.style.pointerEvents = "none";
     const yPositions = ticks.map(tick => Number(tick.getAttribute("y")));
     const finiteY = yPositions.filter(Number.isFinite);
@@ -657,7 +676,7 @@
     ticks.forEach((tick, index) => {
       const y = yPositions[index];
       const ratio = Number.isFinite(y)
-        ? (bottomY - y) / Math.max(1, bottomY - topY)
+        ? 1 - [...finiteY].sort((a, b) => a - b).indexOf(y) / Math.max(1, ticks.length - 1)
         : index / Math.max(1, ticks.length - 1);
       const value = niceMax * Math.max(0, Math.min(1, ratio));
       const label = formatAxisNumber(value);
@@ -667,7 +686,10 @@
         const raw = tick.getAttribute(attribute);
         if (raw !== null) replacement.setAttribute(attribute, raw);
       }
-      replacement.setAttribute("class", "xat-custom-axis-label");
+      replacement.setAttribute("class", `${tick.getAttribute("class") || ""} xat-custom-axis-label`);
+      const tickStyle = getComputedStyle(tick);
+      replacement.style.font = tickStyle.font;
+      replacement.style.letterSpacing = tickStyle.letterSpacing;
       replacement.setAttribute("fill", slot === 0 ? "#1d9bf0" : "#00ba7c");
       replacement.textContent = label;
       labelsGroup.appendChild(replacement);
@@ -710,110 +732,166 @@
     return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(value);
   }
 
-  function injectExtraMetricOptions() {
-    if (!isAccountOverviewPage()) return;
-    const viewport = document.querySelector('[role="listbox"] [data-radix-select-viewport]');
-    if (!viewport || !extraMetrics.size) return;
+  const selectionRequests = [0, 0];
+
+  function canSelectExtraMetric(slot, metric) {
+    return (slot === 0 || slot === 1) && isExtraMetric(metric) && selectedExtraBySlot[1 - slot] !== metric;
+  }
+
+  function commitExtraMetricSelection(slot, metric) {
+    if (!canSelectExtraMetric(slot, metric)) return false;
+    selectedExtraBySlot[slot] = metric;
+    return true;
+  }
+
+  function selectExtraMetric(viewport, option, event) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
     const slot = getOpenMetricSlot(viewport);
-    if (slot < 0) {
-      viewport.querySelectorAll(".xat-extra-option").forEach(option => option.remove());
+    const metric = option.dataset.xatExtraMetric;
+    if (!canSelectExtraMetric(slot, metric) || option.getAttribute("aria-disabled") === "true") return;
+    const request = ++selectionRequests[slot];
+    const nativeGroups = () => document.querySelector("main .recharts-wrapper svg.recharts-surface")
+      ?.querySelectorAll("g.recharts-layer.recharts-bar, g.recharts-layer.recharts-line") || [];
+    const finish = () => {
+      if (selectionRequests[slot] !== request || !commitExtraMetricSelection(slot, metric)) return;
+      render(lastMessage || { items: [] });
+    };
+    if (nativeGroups()[slot]) {
+      closeMetricMenu(slot);
+      finish();
       return;
     }
-    const nativeLabels = new Set([...viewport.querySelectorAll('[role="option"]:not(.xat-extra-option)')].map(option => option.textContent.trim()));
-    for (const option of viewport.querySelectorAll('[role="option"]:not(.xat-extra-option)')) {
+    // A secondary axis set to None needs a native series before we can replace it.
+    const fallback = [...viewport.querySelectorAll('[role="option"]:not(.xat-extra-option)')]
+      .find(item => item.textContent.trim() !== "None" && !item.hasAttribute("data-disabled") && item.getAttribute("aria-disabled") !== "true");
+    if (!fallback) return;
+    fallback.click();
+    // The native selection handler invalidates pending requests; this one starts afterwards.
+    const pendingRequest = ++selectionRequests[slot];
+    closeMetricMenu(slot);
+    let attempts = 0;
+    const waitForSeries = () => {
+      if (selectionRequests[slot] !== pendingRequest) return;
+      if (nativeGroups()[slot]) {
+        if (commitExtraMetricSelection(slot, metric)) render(lastMessage || { items: [] });
+      } else if (++attempts < 15) setTimeout(waitForSeries, 80);
+    };
+    setTimeout(waitForSeries, 0);
+  }
+
+  function injectExtraMetricOptions() {
+    if (!isAccountOverviewPage()) return;
+    const listbox = [...document.querySelectorAll('[role="listbox"]')].find(isVisible);
+    const viewport = listbox?.querySelector('[data-radix-select-viewport]') || listbox;
+    if (!viewport || !extraMetrics.size) return;
+    const slot = getOpenMetricSlot(viewport);
+    if (slot !== 0 && slot !== 1) return;
+    const nativeOptions = [...viewport.querySelectorAll('[role="option"]:not(.xat-extra-option)')];
+    const template = nativeOptions.find(item => !item.hasAttribute("data-disabled")) || nativeOptions[0];
+    if (!template) return;
+    const nativeLabels = new Set(nativeOptions.map(option => option.textContent.trim()));
+    const checkTemplate = viewport.querySelector('[data-icon="icon-checkmark"], [data-radix-select-item-indicator] svg');
+    for (const option of nativeOptions) {
       if (option.dataset.xatNativeBound) continue;
       option.dataset.xatNativeBound = "true";
       const resetNativeSlot = () => {
-        if (slot >= 0 && slot < 2) selectedExtraBySlot[slot] = null;
-        replacementSlot = null;
+        const targetSlot = getOpenMetricSlot(viewport);
+        if (targetSlot !== 0 && targetSlot !== 1 || option.hasAttribute("data-disabled") || option.getAttribute("aria-disabled") === "true") return;
+        ++selectionRequests[targetSlot];
+        selectedExtraBySlot[targetSlot] = null;
         clearReplacement();
-        cleanupCustomChartArtifacts();
         chartState = null;
         setTimeout(() => {
-          if (slot < 0 || selectedExtraBySlot[slot]) return;
-          setMetricTriggerLabel(getMetricTriggers()[slot], option.textContent.trim());
+          if (!selectedExtraBySlot[targetSlot]) setMetricTriggerLabel(getMetricTriggers()[targetSlot], option.textContent.trim());
+          renderHomeSeries();
         }, 0);
       };
-      // Radix commits Select values on pointerdown. Binding click as well made
-      // each change tear down and rebuild the chart twice.
-      option.addEventListener("pointerdown", resetNativeSlot, true);
+      option.addEventListener("click", resetNativeSlot, true);
+      option.addEventListener("keydown", event => {
+        if (event.key === "Enter" || event.key === " ") resetNativeSlot();
+      }, true);
     }
     for (const [metric, metricLabel] of extraMetrics) {
-      if (!isExtraMetric(metric) || !hasEnoughHistory(metric)) continue;
-      if (!metric || nativeLabels.has(metricLabel) || viewport.querySelector(`[data-xat-extra-metric="${CSS.escape(metric)}"]`)) continue;
-      const option = document.createElement("div");
-      option.className = "xat-extra-option relative flex w-full cursor-pointer select-none items-center rounded-xs py-1.5 pl-8 pr-2 text-sm outline-hidden";
-      option.setAttribute("role", "option");
-      option.setAttribute("tabindex", "-1");
-      option.dataset.xatExtraMetric = metric;
-      option.innerHTML = `<span class="xat-extra-check absolute left-2 flex h-3.5 w-3.5 items-center justify-center"></span><span>${escapeHtml(metricLabel)}</span>`;
-      const selectExtraMetric = event => {
-        // Radix emits pointerdown followed by click. Handle the selection once;
-        // rendering twice can close the next metric menu before it opens.
-        if (option.dataset.xatSelecting === "true") return;
-        option.dataset.xatSelecting = "true";
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        const triggerText = getMetricTriggers()[slot]?.textContent.trim();
-        if (["None", "Select secondary metric"].includes(triggerText)) {
-          viewport.closest('[role="listbox"]')?.remove();
-          showSelectionNotice("Choose a native metric first");
-          return;
+      if (!isExtraMetric(metric) || !hasEnoughHistory(metric) || nativeLabels.has(metricLabel)) continue;
+      let option = viewport.querySelector(`[data-xat-extra-metric="${CSS.escape(metric)}"]`);
+      if (!option) {
+        option = document.createElement("div");
+        option.className = `${template.className} xat-extra-option`;
+        option.setAttribute("role", "option");
+        option.setAttribute("tabindex", "-1");
+        option.dataset.xatExtraMetric = metric;
+        // Reuse the host's typography and layout, including its active theme.
+        const style = getComputedStyle(template);
+        option.style.font = style.font;
+        option.style.letterSpacing = style.letterSpacing;
+        option.style.padding = style.padding;
+        option.style.borderRadius = style.borderRadius;
+        const label = document.createElement("div");
+        label.className = "flex-1 xat-extra-label";
+        label.textContent = metricLabel;
+        option.appendChild(label);
+        const check = checkTemplate?.cloneNode(true) || document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        check.removeAttribute("style");
+        check.classList.add("xat-extra-check");
+        check.setAttribute("aria-hidden", "true");
+        if (!checkTemplate) {
+          check.setAttribute("viewBox", "0 0 24 24");
+          check.setAttribute("fill", "currentColor");
+          const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+          path.setAttribute("d", "M19.4 6.32 9.64 18.95 4.1 14.1l1.32-1.5 3.95 3.46L17.82 5.1z");
+          check.appendChild(path);
         }
-        replacementSlot = slot >= 0 ? slot : 0;
-        if (replacementSlot > 1) replacementSlot = 0;
-        extraMetric = metric;
-        const nativeGroups = document.querySelectorAll("main .recharts-wrapper svg.recharts-surface g.recharts-layer.recharts-bar");
-        if (!nativeGroups[replacementSlot]) {
-          const fallbackLabel = replacementSlot === 0 ? "Impressions" : "Engagements";
-          const fallback = [...viewport.querySelectorAll('[role="option"]')].find(nativeOption => nativeOption.textContent.trim() === fallbackLabel);
-          if (fallback) {
-            fallback.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, view: window, pointerId: 1, isPrimary: true }));
-            fallback.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, cancelable: true, view: window, pointerId: 1, isPrimary: true }));
-            fallback.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
-          }
-          viewport.closest('[role="listbox"]')?.remove();
-          let attempts = 0;
-          const waitForNativeSlot = () => {
-            const groups = document.querySelectorAll("main .recharts-wrapper svg.recharts-surface g.recharts-layer.recharts-bar");
-            if (groups[replacementSlot] || attempts++ > 12) {
-              selectedExtraBySlot[replacementSlot] = metric;
-              render(lastMessage || { items: [] });
-              return;
-            }
-            setTimeout(waitForNativeSlot, 100);
-          };
-          setTimeout(waitForNativeSlot, 100);
-          return;
-        }
-        viewport.closest('[role="listbox"]')?.remove();
-        selectedExtraBySlot[replacementSlot] = metric;
-        render(lastMessage || { items: [] });
-      };
-      // Radix selects native items on pointerdown. Capture that single event so
-      // the custom option cannot fall through to a native item underneath it.
-      option.addEventListener("pointerdown", selectExtraMetric, true);
-      viewport.appendChild(option);
-    }
-    const selected = selectedExtraBySlot[slot];
-    for (const option of viewport.querySelectorAll('[role="option"]')) {
-      const isCustom = option.classList.contains("xat-extra-option");
-      const isSelected = isCustom && option.dataset.xatExtraMetric === selected;
-      option.setAttribute("aria-selected", isSelected ? "true" : "false");
-      if (isCustom) {
-        const check = option.querySelector(".xat-extra-check");
-        if (check) check.textContent = isSelected ? "✓" : "";
-      } else if (selected) {
-        option.setAttribute("data-state", "unchecked");
-        option.setAttribute("aria-checked", "false");
-        option.setAttribute("data-highlighted", "false");
-        option.dataset.xatNativeUnselected = "true";
-        option.style.setProperty("background-color", "transparent", "important");
-        const indicator = option.querySelector('[data-radix-select-item-indicator]');
-        if (indicator) indicator.style.visibility = "hidden";
-        option.querySelectorAll("svg").forEach(icon => { icon.style.visibility = "hidden"; });
+        option.appendChild(check);
+        option.addEventListener("pointerdown", event => selectExtraMetric(viewport, option, event), true);
+        option.addEventListener("click", event => {
+          // Keyboard and accessibility activation may emit click without pointerdown.
+          if (event.detail === 0) selectExtraMetric(viewport, option, event);
+          else { event.preventDefault(); event.stopImmediatePropagation(); }
+        }, true);
+        viewport.appendChild(option);
       }
+      const disabled = selectedExtraBySlot[1 - slot] === metric;
+      option.setAttribute("aria-disabled", String(disabled));
+      option.toggleAttribute("data-disabled", disabled);
+      option.setAttribute("aria-selected", String(selectedExtraBySlot[slot] === metric));
     }
+    for (const option of nativeOptions) {
+      // Hide only the old native selection marker; retain hover, focus and icons.
+      option.classList.toggle("xat-native-selection-replaced", Boolean(selectedExtraBySlot[slot]));
+      if (selectedExtraBySlot[slot]) option.setAttribute("aria-selected", "false");
+    }
+    if (!listbox.dataset.xatKeyboardBound) {
+      listbox.dataset.xatKeyboardBound = "true";
+      listbox.addEventListener("keydown", event => {
+        if (!["ArrowDown", "ArrowUp", "Home", "End", "Enter", " "].includes(event.key)) return;
+        const options = [...viewport.querySelectorAll('[role="option"]')]
+          .filter(item => !item.hasAttribute("data-disabled") && item.getAttribute("aria-disabled") !== "true");
+        const active = document.activeElement?.closest('[role="option"]');
+        let index = options.indexOf(active);
+        if (event.key === "Enter" || event.key === " ") {
+          if (!active) return;
+          event.preventDefault(); event.stopImmediatePropagation();
+          active.click();
+          return;
+        }
+        event.preventDefault(); event.stopImmediatePropagation();
+        if (event.key === "Home") index = 0;
+        else if (event.key === "End") index = options.length - 1;
+        else index = (index + (event.key === "ArrowDown" ? 1 : -1) + options.length) % options.length;
+        options[index]?.focus({ preventScroll: true });
+        options[index]?.scrollIntoView({ block: "nearest" });
+      }, true);
+    }
+  }
+
+  function closeMetricMenu(slot) {
+    // Let the select component update its own open state and remove its portal.
+    // Removing the listbox directly leaves Base UI's trigger stuck expanded.
+    const trigger = getMetricTriggers()[slot];
+    trigger?.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "Escape", code: "Escape", bubbles: true, cancelable: true
+    }));
   }
 
   function getOpenMetricSlot(viewport) {
@@ -826,8 +904,15 @@
     // listbox markup, so guard it explicitly before adding metric options.
     const triggerText = slot >= 0 ? triggers[slot]?.textContent.trim() : "";
     const nonMetricValues = new Set(["Bar", "Line", "Daily", "Weekly", "Pay period", "Monthly"]);
-    if (nonMetricValues.has(triggerText)) return -1;
+    if (nonMetricValues.has(triggerText) || slot > 1) return -1;
     return slot;
+  }
+
+  function getChartLayoutSignature(svg) {
+    if (!svg) return "";
+    const elements = [svg, ...svg.querySelectorAll(".recharts-cartesian-grid-horizontal line, g.recharts-bar .recharts-rectangle")];
+    return JSON.stringify(elements.map(element =>
+      ["width", "height", "x", "y", "x1", "x2", "y1", "y2"].map(name => element.getAttribute(name))));
   }
 
   function getNativeLayout(svg, count) {
@@ -847,10 +932,12 @@
           x: Number(rect.getAttribute("x")),
           width: Number(rect.getAttribute("width")),
         }))
-        .filter(rect => Number.isFinite(rect.x) && Number.isFinite(rect.width)))
+        .filter(rect => Number.isFinite(rect.x) && Number.isFinite(rect.width))
+        // X emits recent days first in the DOM; values are chronological.
+        .sort((a, b) => a.x - b.x))
       .filter(group => group.length);
     const firstSeries = series[0] || [];
-    const barWidth = Math.max(8, Math.min(34, firstSeries[0]?.width || ((x2 - x1) / count) * .22));
+    const barWidth = firstSeries[0]?.width || Math.max(1, ((x2 - x1) / count) * .22);
     const nativeXs = firstSeries.map(rect => rect.x);
     const nativeGap = series[1]?.[0] ? series[1][0].x - firstSeries[0].x - barWidth : barWidth * .25;
     return {
@@ -880,7 +967,9 @@
       if (!grid || !daysList.length) return;
       const left = Number(grid.getAttribute("x1"));
       const right = Number(grid.getAttribute("x2"));
-      const index = Math.max(0, Math.min(daysList.length - 1, Math.floor((x - left) / ((right - left) / daysList.length))));
+      const fraction = (x - left) / Math.max(1, right - left);
+      const index = Math.max(0, Math.min(daysList.length - 1, chartState.lineMode
+        ? Math.round(fraction * (daysList.length - 1)) : Math.floor(fraction * daysList.length)));
       hoverDay = daysList[index];
       if (!tooltipFrame) {
         tooltipFrame = requestAnimationFrame(() => {
@@ -901,11 +990,13 @@
       if (!metric) return;
       const replacement = nativeRows[slot];
       if (!replacement) return;
-      const label = replacement.querySelector("span.text-gray-600");
-      const value = replacement.querySelector("span.text-text");
+      const label = replacement.querySelector("span.text-secondary, span.text-gray-600");
+      const value = replacement.querySelector("span.font-mono, span.text-text");
       const swatch = replacement.querySelector("div.shrink-0");
-      if (label) label.textContent = humanMetricName(metric);
-      if (value) value.textContent = formatNumber(getDayValue(hoverDay, metric));
+      const metricLabel = humanMetricName(metric);
+      const metricValue = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(getDayValue(hoverDay, metric));
+      if (label && label.textContent !== metricLabel) label.textContent = metricLabel;
+      if (value && value.textContent !== metricValue) value.textContent = metricValue;
       if (swatch) swatch.style.backgroundColor = slot === 0 ? "#1d9bf0" : "#00ba7c";
     });
   }
@@ -1026,7 +1117,7 @@
       button.getAttribute("aria-pressed") === "true" ||
       button.getAttribute("aria-checked") === "true" ||
       button.getAttribute("data-state") === "on" ||
-      button.className.includes("bg-text"));
+      button.className.includes("bg-text") || button.classList.contains("bg-btn-primary"));
     return getRangeKey(active);
   }
 
@@ -1117,10 +1208,13 @@
         });
       }
       const periodChanged = chartState?.period && chartState.period !== getChartPeriod();
-      if (homeEnabled && (periodChanged || !chartState?.groups?.some(group => group.isConnected) || !document.querySelector("main .recharts-wrapper svg.recharts-surface"))) renderHomeSeries();
+      const modeChanged = chartState && chartState.lineMode !== Boolean(chartState.svg?.querySelector("g.recharts-line"));
+      const layoutChanged = chartState && chartState.layoutSignature !== getChartLayoutSignature(chartState.svg);
+      if (chartState?.wrapper) decorateNativeTooltip(chartState.wrapper);
+      if (homeEnabled && (periodChanged || modeChanged || layoutChanged || !chartState?.groups?.some(group => group.isConnected) || !document.querySelector("main .recharts-wrapper svg.recharts-surface"))) renderHomeSeries();
     });
   });
-  observer.observe(document.documentElement, { childList: true, subtree: true });
+  observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["width", "height", "x", "y", "x1", "x2", "y1", "y2"] });
   window.addEventListener("resize", () => {
     renderHomeSeries();
     const view = document.querySelector("#xat-advanced-view:not([hidden])");

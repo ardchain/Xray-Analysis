@@ -117,25 +117,25 @@ Every explicitly named key that Xray Analytics recognizes is listed here. Unknow
 2. Open `chrome://extensions`.
 3. Enable **Developer mode**.
 4. Click **Load unpacked**.
-5. Select the `twitter-analysis-extension` directory.
+5. Select the cloned repository directory containing `manifest.json`.
 6. Open `https://x.com/i/account_analytics/overview` while signed in to X, then reload the page once.
 
 After source changes, use **Reload** on the **Xray Analytics** extension card, then reload the X Analytics tab. Clicking the toolbar icon opens or focuses Account overview.
 
 ## Use
 
-Choose a native metric in either Account overview picker, then open that picker to find eligible Xray metrics beneath the native X options. If the second picker is set to **None**, choose a native secondary metric first: X does not create a second chart axis until it has a native series.
+Choose a native metric in either Account overview picker, then open that picker to find eligible Xray metrics beneath the native X options. If the second picker is set to **None**, choosing a custom metric automatically initializes its axis. A custom metric already selected on one axis is disabled in the other picker.
 
 The **Verified** control follows X's own filter behavior. When enabled, Xray uses only records that X marks as verified; when disabled, verified, unverified, and unlabelled records are combined.
 
 ## If you are an AI coding agent
 
-You are maintaining a local Chrome extension at `<repository>/twitter-analysis-extension`. Your job is to extend X Account overview without replacing or imitating the rest of X Analytics. Read the metric caveat and availability rules above before changing parsing, labels, or chart logic.
+You are maintaining a local Chrome extension in this repository root. Your job is to extend X Account overview without replacing or imitating the rest of X Analytics. Read the metric caveat and availability rules above before changing parsing, labels, or chart logic.
 
 When you need to test a change:
 
 1. Open `chrome://extensions` and enable **Developer mode** if necessary.
-2. Load unpacked from `<repository>/twitter-analysis-extension`.
+2. Load unpacked from the repository root containing `manifest.json`.
 3. After each source change, click **Reload** on the **Xray Analytics** extension card.
 4. Reload `https://x.com/i/account_analytics/overview` while signed in to X.
 5. Test only Account overview: both metric pickers, `7D` and `2W`, one custom metric, one native metric, **Verified**, and Bar/Line mode.
@@ -160,3 +160,19 @@ Keep these constraints:
 ## Privacy, security, and limitations
 
 Xray Analytics needs access to `x.com` only to observe X Analytics responses in the browser session. It has no backend, telemetry, remote configuration, or automatic export. The integration depends on X's DOM, GraphQL response shape, and Recharts output, any of which may change without notice. Review the source and permissions before loading it into a browser profile containing sensitive accounts.
+
+## Compatibility update — 2026-10-26 (1.0.1)
+
+- Supports the current Base UI metric list while retaining the older Radix viewport.
+- Closes the metric menu through its keyboard handler so it can reopen normally.
+- Recognizes the current active range button styling, including a persisted 2W selection.
+- Supports native Line series as well as Bar series for custom metrics.
+- Avoids continually rebuilding unchanged axis labels and preserves visible native menu labels.
+
+## Native UI refinement — 2026-10-26 (1.0.2)
+
+Custom metric rows reuse X's native row classes, typography, spacing and trailing checkmark. A custom metric selected on one axis is disabled on the other; selection handlers resolve the active axis at activation and reject duplicates again before committing, including deferred secondary-axis creation. Native selections preserve the other custom series. Arrow keys, Home/End and Enter navigate and activate custom rows. Custom axis labels inherit their typography from the native SVG labels. Tooltip rows use the native layout with the selected metric and exact values. Custom bars reuse native x positions and widths, and redraw when the native chart layout changes.
+
+## Regression checks
+
+Run `node tests/selection.test.cjs` to check independent axis selection, duplicate rejection and chronological bar alignment. No dependencies or account data are needed.

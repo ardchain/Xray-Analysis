@@ -1,30 +1,50 @@
 {
   "manifest_version": 3,
   "name": "Xray Analytics",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "Extended local analytics for X: inspect additional daily engagement metrics in the native chart.",
-  "permissions": ["storage"],
-  "host_permissions": ["https://x.com/*"],
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://x.com/*"
+  ],
   "content_scripts": [
     {
-      "matches": ["https://x.com/i/account_analytics*"],
-      "js": ["page-bridge.js"],
+      "matches": [
+        "https://x.com/i/account_analytics*"
+      ],
+      "js": [
+        "page-bridge.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN"
     },
     {
-      "matches": ["https://x.com/i/account_analytics*"],
-      "js": ["collector.js"],
+      "matches": [
+        "https://x.com/i/account_analytics*"
+      ],
+      "js": [
+        "collector.js"
+      ],
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://x.com/i/account_analytics*"],
-      "css": ["panel.css"],
-      "js": ["panel.js"],
+      "matches": [
+        "https://x.com/i/account_analytics*"
+      ],
+      "css": [
+        "panel.css"
+      ],
+      "js": [
+        "panel.js"
+      ],
       "run_at": "document_idle"
     }
   ],
-  "background": { "service_worker": "background.js" },
+  "background": {
+    "service_worker": "background.js"
+  },
   "action": {
     "default_title": "Open Xray Analytics"
   }
