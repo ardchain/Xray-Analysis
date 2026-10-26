@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Xray Analytics",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Extended local analytics for X: inspect additional daily engagement metrics in the native chart.",
   "permissions": [
     "storage"

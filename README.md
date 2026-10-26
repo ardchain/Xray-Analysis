@@ -176,3 +176,11 @@ Custom metric rows reuse X's native row classes, typography, spacing and trailin
 ## Regression checks
 
 Run `node tests/selection.test.cjs` to check independent axis selection, duplicate rejection and chronological bar alignment. No dependencies or account data are needed.
+
+## Pay period correction — 2026-10-26 (1.0.3)
+
+Pay period now sums daily observations into consecutive 14-day buckets aligned to X's native date labels, rather than splitting every month on the 12th and 26th. Changing the visible range preserves the same calendar boundaries; partial periods include only days within that range. Bar positions and tooltip values use these same buckets. The series total is conserved when switching from Daily to Pay period.
+
+Time spent in feed and Impressions represent different signals, and the native chart scales its blue and green axes independently. Taller bars do not imply a larger comparable count, and the extension does not cap one metric to the other.
+
+Run `node tests/periods.test.cjs` to check Pay period boundaries, partial periods and conservation of totals.

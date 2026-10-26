@@ -911,8 +911,10 @@
   function getChartLayoutSignature(svg) {
     if (!svg) return "";
     const elements = [svg, ...svg.querySelectorAll(".recharts-cartesian-grid-horizontal line, g.recharts-bar .recharts-rectangle")];
-    return JSON.stringify(elements.map(element =>
-      ["width", "height", "x", "y", "x1", "x2", "y1", "y2"].map(name => element.getAttribute(name))));
+    return JSON.stringify([
+      elements.map(element => ["width", "height", "x", "y", "x1", "x2", "y1", "y2"].map(name => element.getAttribute(name))),
+      [...svg.querySelectorAll('text[orientation="bottom"]')].map(label => label.textContent),
+    ]);
   }
 
   function getNativeLayout(svg, count) {
@@ -1013,12 +1015,12 @@
     return controls[2]?.textContent.trim() || "Daily";
   }
 
-  function aggregateMetricMap(source, period) {
+  function aggregateMetricMap(source, period, payPeriodAnchor = period === "Pay period" ? getNativePayPeriodAnchor() : null) {
     if (period === "Daily") return new Map(source);
     const result = new Map();
     for (const [day, data] of source.entries()) {
       if (day === "No date") continue;
-      const bucket = getPeriodBucket(day, period);
+      const bucket = getPeriodBucket(day, period, payPeriodAnchor);
       const current = result.get(bucket) || { verified: 0, unverified: 0, unknown: 0, items: [] };
       current.verified += data.verified;
       current.unverified += data.unverified;
@@ -1029,15 +1031,32 @@
     return result;
   }
 
-  function getPeriodBucket(day, period) {
+  function getNativePayPeriodAnchor() {
+    const { start, end } = getDateWindow();
+    const earliest = start.getTime() - 14 * 86400000;
+    const labels = document.querySelectorAll('main .recharts-wrapper svg text[orientation="bottom"]');
+    for (const label of labels) {
+      // Resolve the year against the displayed range, including New Year.
+      const text = label.textContent.trim();
+      if (!/^[A-Za-z]+\s+\d{1,2}$/.test(text)) continue;
+      for (let year = start.getUTCFullYear() - 1; year <= end.getUTCFullYear(); year++) {
+        const time = Date.parse(`${text} ${year} 00:00:00 GMT`);
+        if (Number.isFinite(time) && time >= earliest && time <= end.getTime()) return time;
+      }
+    }
+    // Observed native boundary; retains the same 14-day cadence while ticks mount.
+    return Date.UTC(2026, 9, 21);
+  }
+
+  function getPeriodBucket(day, period, payPeriodAnchor) {
     const date = new Date(`${day}T00:00:00Z`);
     if (period === "Monthly") return `${day.slice(0, 7)}-01`;
     if (period === "Pay period") {
-      const year = date.getUTCFullYear();
-      const month = date.getUTCMonth();
-      const start = date.getUTCDate() >= 12 && date.getUTCDate() < 26 ? 12 : 26;
-      const bucketMonth = date.getUTCDate() < 12 ? month - 1 : month;
-      return toInputDate(new Date(Date.UTC(year, bucketMonth, start)));
+      // Use X's rendered calendar, not fixed dates within each month.
+      const anchor = payPeriodAnchor ?? getNativePayPeriodAnchor();
+      const interval = 14 * 24 * 60 * 60 * 1000;
+      const offset = Math.floor((date.getTime() - anchor) / interval);
+      return toInputDate(new Date(anchor + offset * interval));
     }
     if (period === "Weekly") {
       const dayOfWeek = date.getUTCDay();
